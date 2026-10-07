@@ -1,0 +1,302 @@
+name: microservice
+
+x-infra-healthcheck: &infra-healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 5
+
+x-spring-common: &spring-common
+  restart: unless-stopped
+  environment: &spring-env
+    SPRING_PROFILES_ACTIVE: prod
+    CONFIG_SERVER_HOST: config
+    EUREKA_HOST: registry
+    # JWT_SECRET / INTERNAL_TOKEN 不设默认值：缺失时业务服务启动即失败（fail-fast）
+    JWT_SECRET: ${JWT_SECRET:-}
+    JWT_EXPIRATION: ${JWT_EXPIRATION:-86400000}
+    INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+    JWT_COOKIE_SECURE: ${JWT_COOKIE_SECURE:-false}
+    PROD_DB_PASSWORD: ${PROD_DB_PASSWORD:-ideatest2026}
+    RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-ideatest2026}
+    ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+    ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+  networks:
+    - microservice-net
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: microservice-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-ideatest_prod}
+      POSTGRES_PASSWORD: ${PROD_DB_PASSWORD:-ideatest2026}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ideatest_prod} -d postgres"]
+      <<: *infra-healthcheck
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    networks:
+      microservice-net:
+        aliases:
+          - prod-db
+
+  redis:
+    image: redis:7-alpine
+    container_name: microservice-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *infra-healthcheck
+    ports:
+      - "127.0.0.1:6379:6379"
+    networks:
+      microservice-net:
+        aliases:
+          - prod-redis
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+    container_name: microservice-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE 'green|yellow'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "127.0.0.1:9200:9200"
+    networks:
+      microservice-net:
+        aliases:
+          - prod-elasticsearch
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: microservice-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-ideatest_prod}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-ideatest2026}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      <<: *infra-healthcheck
+      start_period: 20s
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      microservice-net:
+        aliases:
+          - prod-rabbitmq
+
+  registry:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: microservice-registry
+    image: microservice/registry:latest
+    container_name: microservice-registry
+    restart: unless-stopped
+    environment:
+      EUREKA_HOST: registry
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8761/actuator/health"]
+      <<: *infra-healthcheck
+      start_period: 30s
+    ports:
+      - "127.0.0.1:8761:8761"
+    networks:
+      - microservice-net
+
+  config:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: microservice-config
+    image: microservice/config:latest
+    container_name: microservice-config
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8888/actuator/health"]
+      <<: *infra-healthcheck
+      start_period: 30s
+    ports:
+      - "127.0.0.1:8888:8888"
+    networks:
+      - microservice-net
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: microservice-gateway
+    image: microservice/gateway:latest
+    container_name: microservice-gateway
+    restart: unless-stopped
+    depends_on:
+      registry:
+        condition: service_healthy
+      config:
+        condition: service_healthy
+    environment:
+      EUREKA_HOST: registry
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/actuator/health"]
+      <<: *infra-healthcheck
+      start_period: 40s
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - microservice-net
+
+  user-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: user-service
+    image: microservice/user-service:latest
+    container_name: microservice-user-service
+    <<: *spring-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      config:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8081/actuator/health"]
+      <<: *infra-healthcheck
+      start_period: 40s
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - service_logs:/app/logs
+
+  product-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: product-service
+    image: microservice/product-service:latest
+    container_name: microservice-product-service
+    <<: *spring-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      config:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8082/actuator/health"]
+      <<: *infra-healthcheck
+      start_period: 40s
+    ports:
+      - "127.0.0.1:8082:8082"
+    volumes:
+      - service_logs:/app/logs
+
+  cart-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: cart-service
+    image: microservice/cart-service:latest
+    container_name: microservice-cart-service
+    <<: *spring-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      config:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8083/actuator/health"]
+      <<: *infra-healthcheck
+      start_period: 40s
+    ports:
+      - "127.0.0.1:8083:8083"
+    volumes:
+      - service_logs:/app/logs
+
+  order-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: order-service
+    image: microservice/order-service:latest
+    container_name: microservice-order-service
+    <<: *spring-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      config:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8084/actuator/health"]
+      <<: *infra-healthcheck
+      start_period: 40s
+    ports:
+      - "127.0.0.1:8084:8084"
+    volumes:
+      - service_logs:/app/logs
+
+  nginx:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: microservice/nginx:latest
+    container_name: microservice-nginx
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    networks:
+      - microservice-net
+
+networks:
+  microservice-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  es_data:
+  rabbitmq_data:
+  service_logs:

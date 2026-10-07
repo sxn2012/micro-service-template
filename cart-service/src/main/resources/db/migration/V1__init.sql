@@ -1,0 +1,14 @@
+CREATE TABLE IF NOT EXISTS cart (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cart_item (
+    id BIGSERIAL PRIMARY KEY,
+    cart_id BIGINT NOT NULL REFERENCES cart(id),
+    product_id BIGINT NOT NULL,
+    quantity INT NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_cart_user ON cart(user_id);
